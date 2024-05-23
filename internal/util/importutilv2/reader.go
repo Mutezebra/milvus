@@ -18,6 +18,7 @@ package importutilv2
 
 import (
 	"context"
+	"github.com/milvus-io/milvus/internal/util/importutilv2/csv"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
@@ -70,6 +71,8 @@ func NewReader(ctx context.Context,
 		return numpy.NewReader(ctx, cm, schema, importFile.GetPaths(), bufferSize)
 	case Parquet:
 		return parquet.NewReader(ctx, cm, schema, importFile.GetPaths()[0], bufferSize)
+	case CSV:
+		return csv.NewReader(ctx, cm, schema, importFile.GetPaths()[0], bufferSize)
 	}
 	return nil, merr.WrapErrImportFailed("unexpected import file")
 }
