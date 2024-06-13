@@ -13,10 +13,9 @@ import (
 )
 
 type Parser struct {
-	line          int
-	haveMetaField bool     // 记录是否有 "$meta" 字段
-	parsers       []parser // 只负责存储所有的parser
-	r             *csv.Reader
+	line    int
+	parsers []parser // 只负责存储所有的parser
+	r       *csv.Reader
 }
 
 // parser 抽象了 colParser 和 dynamicFieldParser，
@@ -28,10 +27,9 @@ type parser interface {
 
 func NewParser(reader *csv.Reader) *Parser {
 	return &Parser{
-		line:          1,
-		haveMetaField: false,
-		parsers:       make([]parser, 0),
-		r:             reader,
+		line:    1,
+		parsers: make([]parser, 0),
+		r:       reader,
 	}
 }
 
@@ -52,7 +50,6 @@ func (p *Parser) Parse() (Row, error) {
 		}
 		row[parser.getFieldID()] = data
 	}
-	fmt.Printf("\n\n successful read from files and format is %v \n\n", row)
 	return row, nil
 }
 
@@ -73,6 +70,10 @@ func (p *Parser) AddDynamicFieldParser(index int, name2index map[string]int, sch
 		name2index:  name2index,
 	}
 	p.parsers = append(p.parsers, dcp)
+}
+
+func (p *Parser) UpdateReader(r *csv.Reader) {
+	p.r = r
 }
 
 type colParser struct {
@@ -360,6 +361,9 @@ func (p *dynamicFieldParser) getFieldID() int64 {
 }
 
 func (p *dynamicFieldParser) parse(records []string, line int) (any, error) {
+	if p.index >= len(records) {
+		return []byte("{}"), nil
+	}
 	var mp map[string]interface{}
 	if p.index != -1 {
 		record := &records[p.index]

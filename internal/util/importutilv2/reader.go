@@ -72,7 +72,7 @@ func NewReader(ctx context.Context,
 	case Parquet:
 		return parquet.NewReader(ctx, cm, schema, importFile.GetPaths()[0], bufferSize)
 	case CSV:
-		return csv.NewReader(ctx, cm, schema, importFile.GetPaths()[0], bufferSize)
+		return csv.NewReader(ctx, cm, schema, importFile.GetPaths(), bufferSize)
 	}
 	return nil, merr.WrapErrImportFailed("unexpected import file")
 }

@@ -84,9 +84,6 @@ func GetFileType(file *internalpb.ImportFile) (FileType, error) {
 		}
 		return Parquet, nil
 	case CSVFileExt:
-		if len(file.GetPaths()) != 1 {
-			return Invalid, merr.WrapErrImportFailed("for CSV import, accepts only one file")
-		}
 		return CSV, nil
 	}
 
