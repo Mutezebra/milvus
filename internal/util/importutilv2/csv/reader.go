@@ -5,162 +5,127 @@ import (
 	"encoding/csv"
 	"fmt"
 	"github.com/cockroachdb/errors"
-	"io"
-	"sync"
-	"time"
-
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/pkg/util/conc"
 	"github.com/milvus-io/milvus/pkg/util/merr"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 	"go.uber.org/atomic"
+	"io"
+	"time"
 )
 
 type reader struct {
 	ctx    context.Context
+	cancel func()
 	cm     storage.ChunkManager
 	schema *schemapb.CollectionSchema
 
 	fileSize  *atomic.Int64
 	filePaths []string
-	r         *csv.Reader
 
 	bufferSize int
 	count      int64 // count of one batch
+	comma      rune
+	haveFields bool
 
-	parsers    []*Parser
-	once       sync.Once
-	leaveTasks *atomic.Int32
-	dataCh     chan *storage.InsertData
-	errCh      chan error
-	cancel     func()
-	wg         sync.WaitGroup
+	parsers []*Parser
+	dataCh  chan *storage.InsertData
+	future1 *conc.Future[struct{}]
+	future2 *conc.Future[struct{}]
+	tasks   chan int16
 }
 
 type Row = map[storage.FieldID]any
 
+const (
+	CommaKey      = "comma"
+	HaveFieldsKey = "have_fields"
+)
+
 // NewReader initializes a new instance of reader with the provided parameters.
-func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.CollectionSchema, paths []string, bufferSize int) (*reader, error) {
+func NewReader(ctx context.Context, cm storage.ChunkManager, schema *schemapb.CollectionSchema, paths []string, bufferSize int, options map[string]string) (*reader, error) {
 	count, err := estimateReadCountPerBatch(bufferSize, schema)
 	if err != nil {
 		return nil, err
 	}
+	child, cancel := context.WithCancel(ctx)
+
 	reader := &reader{
-		ctx:        ctx,
+		ctx:        child,
+		cancel:     cancel,
 		cm:         cm,
 		schema:     schema,
 		fileSize:   atomic.NewInt64(0),
 		filePaths:  paths,
 		bufferSize: bufferSize,
 		count:      count,
+		comma:      ',',
+		haveFields: true,
 		parsers:    make([]*Parser, len(paths)),
-		leaveTasks: atomic.NewInt32(int32(len(paths))),
-		dataCh:     make(chan *storage.InsertData),
-		errCh:      make(chan error),
-		cancel:     func() {},
+		dataCh:     make(chan *storage.InsertData, 1),
+	}
+	if err = reader.initConfig(options); err != nil {
+		return nil, err
 	}
 	if err = reader.initParsers(); err != nil {
 		return nil, err
 	}
-
+	reader.initFutures()
 	return reader, nil
 }
 
-// Read initiates reading from the CSV files and returns the data or an error.
+// Read returns the data or an error.
 func (r *reader) Read() (*storage.InsertData, error) {
-	r.once.Do(func() {
-		ctx, cancel := context.WithCancel(r.ctx)
-		r.cancel = cancel
-		for i := 0; i < len(r.filePaths); i++ {
-			go r.read(ctx, i)
-		}
-		r.wg.Add(len(r.filePaths))
-	})
-	data := <-r.dataCh
-	err := <-r.errCh
-	time.Sleep(3 * time.Millisecond) // to prevent the defer function from not having been executed yet
-	if errors.Is(err, io.EOF) {      // there are two scenarios: one is that a certain file has been completely read, and the other is that all files have been read. As long as the program executes normally, the final return will definitely be here, so there is no need to use defer r.close() to close the resources
-		if r.leaveTasks.Load() == 0 {
-			r.close()
-			return data, err
-		}
+	select {
+	case data := <-r.dataCh:
 		return data, nil
-	}
-	if err != nil {
+	case <-r.inner():
 		r.close()
-		return data, err
-	}
-	return data, nil
-}
-
-// read is a private method that manages reading and parsing data from a single file.
-func (r *reader) read(ctx context.Context, i int) {
-	defer func() { r.leaveTasks.Dec(); r.wg.Done() }()
-	pr := r.parsers[i]
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			data, err := r.processBatch(pr)
-			r.dataCh <- data
-			r.errCh <- err
-			if err != nil {
-				return
-			}
-			continue
+		err := r.err()
+		if err == nil {
+			return nil, io.EOF
 		}
-	}
-}
-
-// processBatch processes a single batch of records from the CSV file.
-func (r *reader) processBatch(pr *Parser) (*storage.InsertData, error) {
-	insertData, err := storage.NewInsertData(r.schema)
-	if err != nil {
 		return nil, err
 	}
+}
 
-	var cnt int64
-	var countNumber int
-	for {
-		if cnt >= r.count {
-			cnt = 0
-			if insertData.GetMemorySize() >= r.bufferSize {
-				break
-			}
-		}
-		row, err := pr.Parse()
-		if err != nil {
-			if errors.Is(err, io.EOF) && countNumber != 0 {
-				return insertData, nil
-			}
-			return insertData, err
-		}
-		if err = insertData.Append(row); err != nil {
-			return nil, err
-		}
-		countNumber++
-		cnt++
+func (r *reader) Size() (int64, error) {
+	if size := r.fileSize.Load(); size != 0 {
+		return size, nil
 	}
-	return insertData, nil
-}
-
-// close gracefully terminates all operations and closes channels.Non-idempotent.
-func (r *reader) close() { //
-	r.cancel()
-	go func() { // in the event of an error, it is possible to receive data that was successfully read but not yet received, along with the error.
-		for r.leaveTasks.Load() != 0 {
-			_ = <-r.dataCh
-			_ = <-r.errCh
+	for i := 0; i < len(r.parsers); i++ {
+		size, err := r.cm.Size(r.ctx, r.filePaths[i])
+		if err != nil {
+			return 0, err
 		}
-	}()
-	r.wg.Wait()
-	close(r.dataCh)
-	close(r.errCh)
+		r.fileSize.Add(size)
+	}
+	return r.fileSize.Load(), nil
 }
 
-var Comma = '\x01'
-var haveFields = false
+func (r *reader) Close() {}
+
+func (r *reader) initConfig(options map[string]string) error {
+	for key, v := range options {
+		switch key {
+		case CommaKey:
+			if len(v) != 1 {
+				return merr.WrapErrImportFailed("the length of comma must be 1")
+			}
+			r.comma = rune(v[0])
+		case HaveFieldsKey:
+			if v == "TRUE" || v == "True" || v == "true" || v == "1" {
+				r.haveFields = true
+			} else if v == "FALSE" || v == "False" || v == "false" || v == "0" {
+				r.haveFields = false
+			} else {
+				return merr.WrapErrImportFailed("the wrong value of key `have_fields`")
+			}
+		}
+	}
+	return nil
+}
 
 // initParsers initializes parsers for processing each file.
 func (r *reader) initParsers() error {
@@ -170,22 +135,21 @@ func (r *reader) initParsers() error {
 			return merr.WrapErrImportFailed(fmt.Sprintf("read csv file failed, path=%s, err=%s", path, err.Error()))
 		}
 		rd := csv.NewReader(cmReader)
-		rd.Comma = Comma
-		r.r = rd
+		rd.Comma = r.comma
 
-		if !haveFields {
-			if r.parsers[i], err = r.noFields(); err != nil {
+		if !r.haveFields {
+			if r.parsers[i], err = r.noFields(rd); err != nil {
 				return err
 			}
 			if _, err = cmReader.Seek(0, io.SeekStart); err != nil {
 				return merr.WrapErrImportFailed(fmt.Sprintf("failed when seek file to start,error: %v", err))
 			}
 			rd = csv.NewReader(cmReader)
-			rd.Comma = Comma
+			rd.Comma = r.comma
 			r.parsers[i].UpdateReader(rd)
 			continue
 		}
-		if r.parsers[i], err = r.readFirstLine(); err != nil {
+		if r.parsers[i], err = r.readFirstLine(rd); err != nil {
 			return err
 		}
 	}
@@ -193,9 +157,9 @@ func (r *reader) initParsers() error {
 }
 
 // readFirstLine To check if staticField has any missing or duplicate entries, and whether DynamicField exists
-func (r *reader) readFirstLine() (*Parser, error) {
-	pr := NewParser(r.r)
-	fieldNames, err := r.r.Read()
+func (r *reader) readFirstLine(csvReader *csv.Reader) (*Parser, error) {
+	pr := NewParser(csvReader)
+	fieldNames, err := csvReader.Read()
 	if err != nil {
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("failed to read first line from file, error: %v", err))
 	}
@@ -248,9 +212,9 @@ func (r *reader) readFirstLine() (*Parser, error) {
 }
 
 // noFields To make judgments when there are no fields
-func (r *reader) noFields() (*Parser, error) {
-	pr := NewParser(r.r)
-	result, err := r.r.Read()
+func (r *reader) noFields(csvReader *csv.Reader) (*Parser, error) {
+	pr := NewParser(csvReader)
+	result, err := csvReader.Read()
 	if err != nil {
 		return nil, merr.WrapErrImportFailed(fmt.Sprintf("failed to read first line from file, error: %v", err))
 	}
@@ -289,19 +253,123 @@ func (r *reader) noFields() (*Parser, error) {
 	return pr, nil
 }
 
-func (r *reader) Size() (int64, error) {
-	if size := r.fileSize.Load(); size != 0 {
-		return size, nil
+// initFutures initializes concurrent processing tasks.
+func (r *reader) initFutures() {
+	r.future1 = conc.Go(r.startProcess)
+	if len(r.parsers) > 1 {
+		r.future2 = conc.Go(r.startProcess)
+		r.tasks = make(chan int16, len(r.parsers)+2)
+	} else {
+		r.tasks = make(chan int16, len(r.parsers)+1)
 	}
-	size, err := r.cm.Size(r.ctx, r.filePaths[0])
-	if err != nil {
-		return 0, err
+	for i := 0; i < len(r.parsers); i++ {
+		r.tasks <- int16(i)
 	}
-	r.fileSize.Store(size)
-	return size, nil
+	if len(r.parsers) > 1 {
+		r.tasks <- -1
+	}
+	r.tasks <- -1
 }
 
-func (r *reader) Close() {}
+// startProcess handles the concurrent processing of CSV parsing tasks.
+func (r *reader) startProcess() (struct{}, error) {
+	for taskIndex := range r.tasks {
+		if taskIndex == -1 {
+			return struct{}{}, nil
+		}
+		if err := r.handlerParser(taskIndex); err != nil {
+			return struct{}{}, err
+		}
+	}
+	return struct{}{}, nil
+}
+
+// handlerParser responsible for processing the specified parser,
+// which is used to continuously process and send the parsed data.
+func (r *reader) handlerParser(i int16) error {
+	parser := r.parsers[i]
+	for {
+		data, err := r.processBatch(parser)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		select {
+		case <-r.ctx.Done():
+			return nil
+		default:
+			r.dataCh <- data
+		}
+	}
+}
+
+// processBatch processes a single batch of records from the CSV file.
+func (r *reader) processBatch(pr *Parser) (*storage.InsertData, error) {
+	insertData, err := storage.NewInsertData(r.schema)
+	if err != nil {
+		return nil, err
+	}
+	var cnt int64
+	var countNumber int
+	for {
+		if cnt >= r.count {
+			cnt = 0
+			if insertData.GetMemorySize() >= r.bufferSize {
+				break
+			}
+		}
+		row, err := pr.Parse()
+		if err != nil {
+			if errors.Is(err, io.EOF) && countNumber != 0 {
+				return insertData, nil
+			}
+			return insertData, err
+		}
+		if err = insertData.Append(row); err != nil {
+			return nil, err
+		}
+		countNumber++
+		cnt++
+	}
+	return insertData, nil
+}
+
+func (r *reader) close() {
+	r.cancel()
+	go func() { time.Sleep(1 * time.Millisecond); close(r.dataCh) }()
+	close(r.tasks)
+	for _ = range r.dataCh {
+	}
+}
+
+func (r *reader) inner() <-chan struct{} {
+	if len(r.parsers) == 1 {
+		return r.future1.Inner()
+	}
+	if r.future1.Done() {
+		return r.future2.Inner()
+	}
+	if r.future2.Done() {
+		return r.future1.Inner()
+	}
+	return r.future1.Inner()
+}
+
+func (r *reader) err() error {
+	if len(r.parsers) == 1 {
+		return r.future1.Err()
+	}
+	if r.future1.Done() {
+		return r.future1.Err()
+	}
+	if r.future2.Done() {
+		return r.future2.Err()
+	}
+	return nil
+}
 
 func estimateReadCountPerBatch(bufferSize int, schema *schemapb.CollectionSchema) (int64, error) {
 	sizePerRecord, err := typeutil.EstimateMaxSizePerRecord(schema)

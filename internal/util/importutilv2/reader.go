@@ -18,7 +18,9 @@ package importutilv2
 
 import (
 	"context"
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/util/importutilv2/csv"
+	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/proto/internalpb"
@@ -59,6 +61,9 @@ func NewReader(ctx context.Context,
 		paths := importFile.GetPaths()
 		return binlog.NewReader(ctx, cm, schema, paths, tsStart, tsEnd)
 	}
+	kvs := lo.SliceToMap(options, func(item *commonpb.KeyValuePair) (string, string) {
+		return item.GetKey(), item.GetValue()
+	})
 
 	fileType, err := GetFileType(importFile)
 	if err != nil {
@@ -72,7 +77,7 @@ func NewReader(ctx context.Context,
 	case Parquet:
 		return parquet.NewReader(ctx, cm, schema, importFile.GetPaths()[0], bufferSize)
 	case CSV:
-		return csv.NewReader(ctx, cm, schema, importFile.GetPaths(), bufferSize)
+		return csv.NewReader(ctx, cm, schema, importFile.GetPaths(), bufferSize, kvs)
 	}
 	return nil, merr.WrapErrImportFailed("unexpected import file")
 }
